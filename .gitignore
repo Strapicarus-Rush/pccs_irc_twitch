@@ -1,0 +1,14 @@
+# Ignorar todos los archivos en build/
+build/
+
+# Ignorar archivos objeto
+*.o
+
+# Excluir archivos conocidos con extensión (para no ignorarlos por error)
+!*.cpp
+!*.hpp
+!*.h
+!*.md
+!*.txt
+!*.sh
+!Makefile
