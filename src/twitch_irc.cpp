@@ -29,6 +29,8 @@
 #include <condition_variable>
 #include <poll.h>
 #include <unistd.h> // para write
+// #include <alerta.hpp>
+// #include <sqlite3.h>
 
 // ==========================
 // Configuración global
@@ -38,7 +40,88 @@ static const constexpr int PORT = 6667;
 static const std::string CHANNEL = "#strapicarus";
 static const std::string title = "\033]0;Twitch IRC - " + std::string(CHANNEL) + "\007";
 SDL_Event event;
-// Listas de palabras (originales, sin recortar)
+
+// ==========================
+// Filtrado y detección
+// ==========================
+
+static const constexpr size_t SPAM_THRESHOLD = 2;
+static const constexpr int TIME_WINDOW = 15; // segundos
+static const constexpr int FIRST_COOLDOWN = 5 * 60;   // 5 minutos
+static const constexpr int SECOND_COOLDOWN = 10 * 60; // 10 minutos
+
+// const char* create_table = "CREATE TABLE IF NOT EXISTS logs ("
+//                                    "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+//                                    "timestamp TEXT,"
+//                                    "src_ip TEXT,"
+//                                    "dst_ip TEXT,"
+//                                    "protocol TEXT,"
+//                                    "port INTEGER,"
+//                                    "url TEXT,"
+//                                    "action TEXT)";
+//         sqlite3_exec(db, create_table, nullptr, nullptr, nullptr);
+
+struct UserTTSState {
+    std::deque<std::time_t> timestamps; // mensajes recientes
+    int warning_level = 0;              // 0 = limpio, 1 = advertido, 2 = advertencia final, 3 = bloqueado
+    std::time_t last_warning_time = 0;  // último momento de advertencia
+    std::time_t blocked_until = 0;      // bloqueado hasta
+    bool banned = false;    
+};
+
+std::unordered_map<std::string, UserTTSState> user_tts_states;
+
+//blacklisted
+static const std::regex regex_word_blacklist("(^|\\s)(mierda|carajo|puta|joder|cabrón|coño|pendejo|culero|verga|fuck|shit|asshole|bitch|damn|cunt|dick|faggot|bastard|nigga|niggers|nazi|fucker|chingar|pinche|mamón|gilipollas|maricón|huevón|pija|culo|zorra|cagada|pndejo|vga|mda|jdr|cñ|pt|cbn|ass|cock|prick|twat|pussy|bullshit|motherfucker|sonofabitch|whore|slut|douche|jerk|fuk|shite|asshat|bich|dickhead|fgt|wtf|bs|mf|sob)($|\\s)",std::regex::icase);
+static const std::regex regex_url("(http[s]?://|\\.[a-z]{2,6}|\\[.?dot.?\\]|\\[\\.\\]|dot|\\swww\\.)|[a-z0-9-]+\\.[a-z]{2,6}",std::regex::icase);
+
+//interactions
+static const std::regex regex_greeting("^(alo|hola|holi|hi|hello|hey|que tal|como va|cómo estás|what's up|sup|saludos|buenas|buen día)(\\s|$)",std::regex::icase);
+static const std::regex regex_laugh(R"(\b(lol|lmao|rofl|xd|(?:[hj][aeiou]){3,})(?:\b|_))", std::regex::icase);
+static const std::regex regex_thanks(R"(\b(gracias|thx)\b)", std::regex::icase);
+static const std::regex regex_appreciation(R"(\b(nice|cool|awesome)\b)", std::regex::icase);
+static const std::regex regex_epic(R"(\bepic\b)", std::regex::icase);
+static const std::regex regex_wtf(R"(\bwtf\b)", std::regex::icase);
+static const std::regex regex_f(R"(\b(f|F)\b)", std::regex::icase);
+static const std::regex regex_tic_tac(R"(\b(tic|tac)\b)", std::regex::icase);
+
+//tags, quotes, commands
+static const std::regex regex_tts("^!s\\s", std::regex::icase);
+static const std::regex regex_stream_elements("StreamElements");
+static const std::regex regex_msg("PRIVMSG " + CHANNEL + " :(.+)");
+static const std::regex regex_new_follow(R"(Gracias por seguirme\s+(.+))");
+static const std::regex regex_command("^!c\\s", std::regex::icase);
+static const std::regex regex_quoted(R"((\"|')([^\"']*)\1)");
+// static const std::regex regex_tag_value(key + "=([^;]*)");
+static const std::regex regex_tags(R"(^@([^ ]+))");
+static const std::regex regex_emotes_pos(R"((\s+):([\d\-]+))");
+static const std::regex regex_emotes(
+    R"(:'\(|:'D|:D|c:|;\)|:\)|:\]|:\[|T_T|>:\(|\(y\)|\(n\)|:rocket:|:fire:|<3|\*o\*|:\*|:v|xD)",
+    std::regex::optimize
+);
+
+//Privileges
+static const std::regex regex_tag_moderator("moderator/\\d+");
+static const std::regex regex_tag_subscriber("subscriber/\\d+");
+static const std::regex regex_tag_broadcaster("broadcaster/\\d+");
+static const std::regex regex_tag_vip("vip/\\d+");
+static const std::regex regex_tag_admin("admin/\\d+");
+static const std::regex regex_tag_staff("staff/\\d+");
+static const std::regex regex_tag_partner("partner/\\d+");
+static const std::regex regex_tag_global_mod("global_mod/\\d+");
+static const std::regex regex_tag_bot("bot/\\d+");
+static const std::regex regex_has_privileges("(moderator/\\d+|subscriber/\\d+|broadcaster/\\d+|vip/\\d+|admin/\\d+|staff/\\d+|partner/\\d+|global_mod/\\d+)");
+
+
+static const std::unordered_map<std::string, std::string> text_to_emoji = {
+    {":'D", "\U0001F602"}, {"xD", "\U0001F923"}, {":D", "\U0001F603"},
+    {"c:", "\U0001F604"}, {";)", "\U0001F609"}, {":)", "\U0001F60A"},
+    {":]", "\U0001F642"}, {":[", "\U0001F641"}, {":'(", "\U0001F622"},
+    {"T_T", "\U0001F62D"}, {">:(", "\U0001F621"}, {"(y)", "\U0001F44D"},
+    {"(n)", "\U0001F44E"}, {":rocket:", "\U0001F680"}, {":fire:", "\U0001F525"},
+    {"<3", "\u2764"}, {"*o*", "\U0001F60D"}, {":*", "\U0001F618"}, {":v", "\U0001F92A"}
+};
+
 static const std::unordered_set<std::string> english_words = {
     "the", "and", "to", "of", "a", "in", "is", "you", "that", "it", "next", "all",
     "he", "was", "for", "on", "are", "with", "as", "i", "his", "at", "them", "know",
@@ -139,8 +222,16 @@ const std::string generarNick() {
 }
 const std::string NICK = generarNick();
 
+// ==========================
 // Depuración
+// ==========================
 std::atomic<bool> DEBUG{false};
+void debug_echo(const std::string &msg) {
+    if (DEBUG.load()) {
+        std::cerr << "[DEBUG] " << msg << std::endl;
+    }
+}
+
 // ==========================
 // TTS
 // ==========================
@@ -151,6 +242,36 @@ std::atomic<bool> ttsRunning{false};
 std::atomic<bool> threads_running{false};
 std::atomic<bool> display_needs_update{false};
 std::thread console_refresher;
+
+
+// ==========================
+// ALERTAS
+// ==========================
+std::mutex alert_mutex;
+std::atomic<bool> has_to_show_alert{false};
+size_t alert_type = 0;
+// Constants
+constexpr int SCREEN_WIDTH = 800;
+constexpr int SCREEN_HEIGHT = 600;
+constexpr int DISPLAY_DURATION_MS = 9000;
+// Paths
+const char* IMAGE_PATH = "~/Imágenes/patreon/nuevofollow.jpg";
+const char* AUDIO_PATH = "~/Música/LASERS_EP-11879/LASERS_-_01_-_Amsterdam.flac";
+const char* FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf";
+std::atomic<bool> alert_running {true};
+
+std::string expand_path(const char* path) {
+    if (path[0] == '~') {
+        const char* home = getenv("HOME");
+        return std::string(home) + (path + 1);
+    }
+    return std::string(path);
+}
+
+float lerp(float a, float b, float t) {
+    return a + (b - a) * t;
+}
+
 
 // ==========================
 // Terminal
@@ -187,21 +308,9 @@ void configurarTerminal() {
     signal(SIGQUIT, restaurarTerminal);
 }
 
-// ==========================
-// Depuración
-// ==========================
-void debug_echo(const std::string &msg) {
-    if (DEBUG.load()) {
-        std::cerr << "[DEBUG] " << msg << std::endl;
-    }
-}
-
 // =========================
 // SDL
 // =========================
-// bool threads_running = false;
-
-// Variables SDL
 SDL_Window* window = nullptr;
 SDL_Renderer* renderer = nullptr;
 TTF_Font* font = nullptr;
@@ -215,8 +324,6 @@ static const constexpr int font_height = 16;
 static const constexpr int window_width = 45 * font_width;
 static const constexpr int window_height = 50 * font_height;
 
-
-// Inicialización de SDL2
 bool init_sdl() {
     if (SDL_Init(SDL_INIT_VIDEO) < 0) return false;
     if (TTF_Init() < 0) return false;
@@ -228,6 +335,8 @@ bool init_sdl() {
     if (!renderer) return false;
 
     font = TTF_OpenFont("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 16); // Asegúrate de tener una fuente monoespaciada
+    // font = TTF_OpenFont("/usr/share/fonts/truetype/fonts-droid-fallback/DroidSansFallback.ttf", 16); // Asegúrate de tener una fuente monoespaciada
+    // font = TTF_OpenFont("/usr/share/fonts/truetype/fonts-font-awesome/fontawesome-webfont.ttf", 16); // Asegúrate de tener una fuente monoespaciada
     if (!font) return false;
 
     // {
@@ -237,7 +346,6 @@ bool init_sdl() {
     return true;
 }
 
-// Limpieza de SDL
 void cleanup_sdl() {
     if (font) TTF_CloseFont(font);
     if (renderer) SDL_DestroyRenderer(renderer);
@@ -246,9 +354,9 @@ void cleanup_sdl() {
     SDL_Quit();
 }
 
-// Renderizado de texto en SDL
 void render_text(const std::string& text, int x, int y, SDL_Color color) {
-    SDL_Surface* surface = TTF_RenderText_Solid(font, text.c_str(), color);
+    SDL_Surface* surface = TTF_RenderUTF8_Blended(font, text.c_str(), color); 
+    // SDL_Surface* surface = TTF_RenderText_Solid(font, text.c_str(), color); TTF_RenderUTF8_Blended
     if (!surface) return;
 
     SDL_Texture* texture = SDL_CreateTextureFromSurface(renderer, surface);
@@ -267,7 +375,6 @@ void render_text(const std::string& text, int x, int y, SDL_Color color) {
 // =========================
 // Todo lo demás...
 // =========================
-
 std::string escape_for_espeak(const std::string &input) {
     std::string escaped;
     escaped.reserve(input.size() + 10);
@@ -286,7 +393,7 @@ void process_tts_queue() {
         tts_type current;
         {
             std::lock_guard<std::mutex> lock(ttsMutex);
-            if (ttsQueue.empty()){
+            if (ttsQueue.empty() || !ttsRunning){
                 ttsRunning = false;
                 break;
             }
@@ -324,60 +431,6 @@ void welcome_new_user(const std::string &user) {
     std::string tts_text = "Bienvenido " + user;
     enqueue_tts(tts_text, DEFAULT_LANGUAGE);
 }
-
-// ==========================
-// Filtrado y detección
-// ==========================
-//blacklisted
-static const std::regex regex_word_blacklist("(^|\\s)(mierda|carajo|puta|joder|cabrón|coño|pendejo|culero|verga|fuck|shit|asshole|bitch|damn|cunt|dick|faggot|bastard|nigga|niggers|nazi|fucker|chingar|pinche|mamón|gilipollas|maricón|huevón|pija|culo|zorra|cagada|pndejo|vga|mda|jdr|cñ|pt|cbn|ass|cock|prick|twat|pussy|bullshit|motherfucker|sonofabitch|whore|slut|douche|jerk|fuk|shite|asshat|bich|dickhead|fgt|wtf|bs|mf|sob)($|\\s)");
-static const std::regex regex_url("(http[s]?://|\\.[a-z]{2,6}|\\[.?dot.?\\]|\\[\\.\\]|dot|\\swww\\.)|[a-z0-9-]+\\.[a-z]{2,6}");
-
-//interactions
-static const std::regex regex_greeting("^(alo|hola|holi|hi|hello|hey|que tal|como va|cómo estás|what's up|sup|saludos|buenas|buen día)(\\s|$)");
-static const std::regex regex_laugh(R"(\b(lol|lmao|rofl|xd|[hj][aeiou](?:[hj][aeiou])+)\b)");
-static const std::regex regex_thanks(R"(\b(gracias|thx)\b)");
-static const std::regex regex_appreciation(R"(\b(nice|cool|awesome)\b)");
-static const std::regex regex_epic(R"(\bepic\b)");
-static const std::regex regex_wtf(R"(\bwtf\b)");
-static const std::regex regex_f(R"(\b(f|F)\b)");
-static const std::regex regex_tic_tac(R"(\b(tic|tac)\b)");
-
-//tags, quotes, commands
-static const std::regex regex_tts("^!s\\s");
-static const std::regex regex_stream_elements("StreamElements");
-static const std::regex regex_msg("PRIVMSG " + CHANNEL + " :(.+)");
-static const std::regex regex_new_follow(R"(Gracias por seguirme\s+(.+))");
-static const std::regex regex_command("^!c\\s");
-static const std::regex regex_quoted(R"((\"|')([^\"']*)\1)");
-// static const std::regex regex_tag_value(key + "=([^;]*)");
-static const std::regex regex_tags(R"(^@([^ ]+))");
-static const std::regex regex_emotes_pos(R"((\s+):([\d\-]+))");
-static const std::regex regex_emotes(
-    R"(:'\(|:'D|:D|c:|;\)|:\)|:\]|:\[|T_T|>:\(|\(y\)|\(n\)|:rocket:|:fire:|<3|\*o\*|:\*|:v|xD)",
-    std::regex::optimize
-);
-
-//Privileges
-static const std::regex regex_tag_moderator("moderator/\\d+");
-static const std::regex regex_tag_subscriber("subscriber/\\d+");
-static const std::regex regex_tag_broadcaster("broadcaster/\\d+");
-static const std::regex regex_tag_vip("vip/\\d+");
-static const std::regex regex_tag_admin("admin/\\d+");
-static const std::regex regex_tag_staff("staff/\\d+");
-static const std::regex regex_tag_partner("partner/\\d+");
-static const std::regex regex_tag_global_mod("global_mod/\\d+");
-static const std::regex regex_tag_bot("bot/\\d+");
-static const std::regex regex_has_privileges("(moderator/\\d+|subscriber/\\d+|broadcaster/\\d+|vip/\\d+|admin/\\d+|staff/\\d+|partner/\\d+|global_mod/\\d+)");
-
-
-static const std::unordered_map<std::string, std::string> text_to_emoji = {
-    {":'D", "\U0001F602"}, {"xD", "\U0001F923"}, {":D", "\U0001F603"},
-    {"c:", "\U0001F604"}, {";)", "\U0001F609"}, {":)", "\U0001F60A"},
-    {":]", "\U0001F642"}, {":[", "\U0001F641"}, {":'(", "\U0001F622"},
-    {"T_T", "\U0001F62D"}, {">:(", "\U0001F621"}, {"(y)", "\U0001F44D"},
-    {"(n)", "\U0001F44E"}, {":rocket:", "\U0001F680"}, {":fire:", "\U0001F525"},
-    {"<3", "\u2764"}, {"*o*", "\U0001F60D"}, {":*", "\U0001F618"}, {":v", "\U0001F92A"}
-};
 
 const std::string replace_emoticons_regex(const std::string& input) {
     std::ostringstream result;
@@ -471,6 +524,7 @@ void process_tts(const std::string& user, const std::string& tts_msgs,
                 bool has_privileges, bool first_msg, bool returning_chatter,
                 const std::string& user_type, bool is_highlighted, const std::string& lang) {
     debug_echo("process_tts: lang=" + lang);
+    if(user == "thebot")
     if (lang == "nil") {
         debug_echo("lang nil returning no tts...");
         return;
@@ -666,6 +720,44 @@ void welcome_new_follow(const std::string &user) {
     enqueue_tts(tts_text, DEFAULT_LANGUAGE);
 }
 
+bool check_spam(const std::string& user) {
+    auto& state = user_tts_states[user];
+    std::time_t now = std::time(nullptr);
+
+    if (state.banned) return false;
+    if (state.blocked_until > now) return false;
+
+    // limpiar mensajes viejos (más de 10 segundos)
+    while (!state.timestamps.empty() && now - state.timestamps.front() > TIME_WINDOW){
+        state.timestamps.pop_front();
+    }
+
+    state.timestamps.push_back(now);
+
+    if (state.warning_level >= 3) {
+        return false; // usuario bloqueado permanentemente
+    }
+
+    if (state.timestamps.size() > SPAM_THRESHOLD) {
+        state.warning_level += 1;
+        if (state.warning_level == 1) {
+            state.blocked_until = now + 300;
+            enqueue_tts(user + ", estás enviando demasiados mensajes. Espera 5 minutos.", "es");
+            state.last_warning_time = now;
+        } else if (state.warning_level == 2 && now - state.last_warning_time > FIRST_COOLDOWN) {
+            enqueue_tts(user + ", segunda advertencia. Espera 10 minutos.", "es");
+            state.blocked_until = now + 600;
+            state.last_warning_time = now;
+        } else if (state.warning_level == 3 && now - state.last_warning_time > SECOND_COOLDOWN) {
+            enqueue_tts(user + ", has sido bloqueado del TTS por spam.", "es");
+            state.banned = true;
+            state.last_warning_time = now;
+        }
+        return false;
+    }
+    return true;
+}
+
 void process_privmsg(const std::string &line) {
     
     std::smatch match;
@@ -675,28 +767,30 @@ void process_privmsg(const std::string &line) {
 
     std::string user = extract_tag_value(tags, "display-name");
 
+    if (!check_spam(user)) return;
+
     std::string color = extract_tag_value(tags, "color");
     if (color.empty()) {
         color = "#FFFFFF";
     }
     rgb_color = hex_to_rgb(color);
     std::string ansi_color = hex_to_ansi(color);
-
-
     
     if (!std::regex_search(line, match, regex_msg)) return;
     std::string raw_msg = match[1];
-    // static const std::regex regex_stream_elements("StreamElements");
+    
     if (std::regex_match(user, regex_stream_elements))
     {  
-        // static const std::regex regex_new_follow(R"(Gracias por seguirme\s+(.+))");
         if (std::regex_search(raw_msg, match, regex_new_follow)) {
             std::string nombre_usuario = match[1];
             return welcome_new_follow(nombre_usuario);
         }
         return;
     }
-    if (contains_blacklisted(raw_msg) || contains_url(raw_msg)) return;
+    if (contains_blacklisted(raw_msg) || contains_url(raw_msg)) {
+        debug_echo("blacklist found...");
+        return;
+    }
 
     std::string badges_raw = extract_tag_value(tags, "badges");
     debug_echo("badges_raw: " + badges_raw);
@@ -934,6 +1028,91 @@ void update_display_sdl() {
     display_cv.notify_one();
 }
 
+void render_alert(SDL_Renderer* renderer, SDL_Texture* imgTexture, SDL_Texture* textTexture, SDL_Rect textRect) {
+    Uint32 start = SDL_GetTicks();
+
+    while (alert_running) {
+        Uint32 now = SDL_GetTicks();
+        Uint32 elapsed = now - start;
+        if (elapsed > DISPLAY_DURATION_MS) break;
+
+        float t = elapsed / static_cast<float>(DISPLAY_DURATION_MS);
+        Uint8 alpha = 255;
+        if (t < 0.2f) {
+            alpha = static_cast<Uint8>(lerp(0, 255, t / 0.2f));
+        } else if (t > 0.8f) {
+            alpha = static_cast<Uint8>(lerp(255, 0, (t - 0.8f) / 0.2f));
+        }
+
+        SDL_SetTextureAlphaMod(imgTexture, alpha);
+        SDL_SetTextureAlphaMod(textTexture, alpha);
+
+        float wobble = std::sinf(now * 0.01f) * 4.0f;
+        float scale = 0.5f + 0.05f * std::sinf(now * 0.001f);
+
+        int iw = static_cast<int>(SCREEN_WIDTH * scale);
+        int ih = static_cast<int>(SCREEN_HEIGHT * scale);
+        int ix = static_cast<int>((SCREEN_WIDTH - iw) / 2 + wobble);
+        int iy = static_cast<int>((SCREEN_HEIGHT - ih) / 2 + wobble);
+        SDL_Rect imgRect = { ix, iy, iw, ih };
+
+        SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+        SDL_RenderClear(renderer);
+        SDL_RenderCopy(renderer, imgTexture, nullptr, &imgRect);
+        SDL_RenderCopy(renderer, textTexture, nullptr, &textRect);
+        SDL_RenderPresent(renderer);
+
+        // Actual OS-level sleep (~60fps, ultra low CPU)
+        // std::this_thread::sleep_for(std::chrono::milliseconds(16));
+    }
+    /*if (std::this_thread.joinable())
+    {
+        std::this_thread.join();
+    }*/
+}
+
+
+void show_alert(){
+    {
+        std::unique_lock<std::mutex> lock(alert_mutex);
+        alert_running = true;
+        debug_echo("[DEBUG] show_alert");
+        if (alert_type == 1)
+        {
+            SDL_Window* alert_wi = SDL_CreateWindow("Follow Alert", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+                                                  SCREEN_WIDTH, SCREEN_HEIGHT, 0);
+            SDL_Renderer* alert_renderer = SDL_CreateRenderer(alert_wi, -1, SDL_RENDERER_ACCELERATED);
+            // Load image
+            std::string imgPath = expand_path(IMAGE_PATH);
+            SDL_Surface* imgSurf = IMG_Load(imgPath.c_str());
+            SDL_Texture* imgTexture = SDL_CreateTextureFromSurface(alert_renderer, imgSurf);
+            SDL_FreeSurface(imgSurf);
+            //textura text
+            TTF_Font* al_font = TTF_OpenFont(FONT_PATH, 48);
+            SDL_Color white = {255, 255, 255, 255};
+            SDL_Surface* textSurf = TTF_RenderText_Blended(font, "Thank you follower", white);
+            SDL_Texture* textTexture = SDL_CreateTextureFromSurface(renderer, textSurf);
+            SDL_Rect textRect = {
+                SCREEN_WIDTH / 2 - textSurf->w / 2,
+                SCREEN_HEIGHT - 120,
+                textSurf->w,
+                textSurf->h
+            };
+            SDL_FreeSurface(textSurf);
+
+            render_alert(alert_renderer, imgTexture, textTexture, textRect);
+            alert_running = false;
+            SDL_DestroyTexture(imgTexture);
+            SDL_DestroyTexture(textTexture);
+            // Mix_FreeMusic(music);
+            TTF_CloseFont(al_font);
+            SDL_DestroyRenderer(alert_renderer);
+            SDL_DestroyWindow(alert_wi);
+            debug_echo("[DEBUG] destroy alert");
+        }
+    } 
+}
+
 
 void welcome_new_sub(const std::string &user, const std::string &sub_plan) {
     std::string plan_text = (sub_plan == "1000") ? "Tier 1" : (sub_plan == "2000") ? "Tier 2" : "Tier 3";
@@ -964,18 +1143,23 @@ void notify_roomstate(const std::string &tags) {
     std::string tts_text;
     try {
         if (emote_only == "1") {
-        debug_echo("emote_only:"+emote_only);
-        tts_text = "El chat ahora es solo emotes.";
-    } else if (slow != "0" && slow.size() > 0) {
-        debug_echo("modo lento:"+slow);
-        tts_text = "El chat está en modo lento, " + slow + " segundos.";
-    } else if (followers_only.size() > 0 && followers_only !="0" ) {
-        debug_echo("followers_only:"+followers_only);
-        tts_text = "El chat es solo para seguidores, con más de " + followers_only + " minutos siguiendo el canal.";
-    } else {
-        tts_text = "El chat ha vuelto a la normalidad.";
-    }
-    enqueue_tts(tts_text, DEFAULT_LANGUAGE);
+            debug_echo("emote_only:"+emote_only);
+            {
+                std::unique_lock<std::mutex> lock(alert_mutex);
+                alert_type = 1;
+                has_to_show_alert = true;
+            }
+            tts_text = "El chat ahora es solo emotes.";
+        } else if (slow != "0" && slow.size() > 0) {
+            debug_echo("modo lento:"+slow);
+            tts_text = "El chat está en modo lento, " + slow + " segundos.";
+        } else if (followers_only.size() > 0 && followers_only !="0" ) {
+            debug_echo("followers_only:"+followers_only);
+            tts_text = "El chat es solo para seguidores, con más de " + followers_only + " minutos siguiendo el canal.";
+        } else {
+            tts_text = "El chat ha vuelto a la normalidad.";
+        }
+        enqueue_tts(tts_text, DEFAULT_LANGUAGE);
     } catch (const std::invalid_argument& e) {
         debug_echo("[ERR] Invalid argument: " + std::string(e.what()));
     } catch (const std::out_of_range& e) {
@@ -1154,6 +1338,7 @@ std::thread start_console_refresher_thread() {
         }
     });
 }
+
 std::thread start_irc_thread() {
     return std::thread([] {
         std::unique_lock<std::mutex> lock(display_mutex);
@@ -1172,6 +1357,7 @@ std::thread start_irc_thread() {
         }
     });
 }
+
 int main(int argc, char* argv[]) {
     if (argc > 1 && std::string(argv[1]) == "-debug") DEBUG = true;
 
@@ -1206,6 +1392,10 @@ int main(int argc, char* argv[]) {
         while (threads_running) {
             if (SDL_PollEvent(&event)) {
                 if (event.type == SDL_QUIT || (event.type == SDL_KEYDOWN && event.key.keysym.sym == SDLK_ESCAPE)) {
+                    if (ttsRunning) {
+                        ttsRunning = false;
+                        continue;
+                    }
                     threads_running = false;
                 }
             }
@@ -1213,6 +1403,12 @@ int main(int argc, char* argv[]) {
             if (display_needs_update) {
                 update_display_sdl();
                 display_needs_update = false;
+            }
+
+            if (has_to_show_alert)
+            {
+                show_alert();
+                has_to_show_alert = false;
             }
 
             SDL_Delay(50); // 20 FPS aprox.
